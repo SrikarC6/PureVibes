@@ -1,0 +1,39 @@
+# Xcode / macOS
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+xcuserdata/
+
+# Swift Package Manager
+.build/
+Packages/
+Package.pins
+Package.resolved
+
+# Dependencies
+Pods/
+Carthage/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Dev files
+latest.md
+compare_metadata.swift
+inspect_metadata.swift
+CLAUDE.md
+MACOS_CONTEXT.md
+.agents/
+.gemini/
