@@ -35,6 +35,7 @@ A minimal, high-fidelity music player for macOS — built entirely in Swift and 
 - The AI functionality isn't required to use the app, and I am working on a local implementation using Apple's MLX protocol. I don't get any user information or data, the AI all runs with Gemini and they handle all the data
 - This app was made entirely with Gemini-CLI and Google Antigravity, with some assistance with Claude Code
 - You may need to go into Privacy/Security settings and allow the app to open, as macOS may claim the application is unsafe and not let you open it
+- You currently cannot use the caroseul view with a mouse, but I am going to implement scroll wheel functionality soon. For now, if you want to use the app with a mouse, you need to switch to Grid View
 
 ## License
 
