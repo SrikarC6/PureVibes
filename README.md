@@ -45,7 +45,12 @@ Under the hood, PureVibes does things most players don't bother with: it reverse
 
 ## Screenshots
 
-![Home Page (Grid View Default)](assets/Grid\View.png)
+![Welcome Screen](assets/welcome-screen.png)
+![Default Grid View](assets/default-grid-view.png)
+![Album View](assets/album-view.png)
+![Optional Carousel View](assets/optional-caroseul-view.png)
+![Favorites View](assets/favorites-view.png)
+![Queue Menu](assets/queue-menu.png)
 
 <!-- Uncomment and replace paths once you have screenshots:
 
