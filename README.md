@@ -45,7 +45,7 @@ Under the hood, PureVibes does things most players don't bother with: it reverse
 
 ## Screenshots
 
-> 📸 **Screenshots coming soon.** To contribute screenshots, see [Contributing](#contributing).
+![Home Page (Grid View Default)](assets/Grid\View.png)
 
 <!-- Uncomment and replace paths once you have screenshots:
 
