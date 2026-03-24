@@ -71,7 +71,7 @@ Under the hood, PureVibes does things most players don't bother with: it reverse
 - **Shuffle** — queue-aware shuffle that preserves the original order for un-shuffle
 
 ### 🎵 Library & Metadata
-- **Apple Digital Master Detection** — reads the `flvr:2` atom, `atID`+`cnID` catalog pair, and `ownr` ownership tag to identify ADM-mastered files; no Apple Music subscription required
+- **Apple Digital Master Detection** — reads the `flvr:2` atom and `atID`+`cnID` catalog pair tag to identify ADM-mastered files; no Apple Music subscription required
 - **Full ID3 + MP4 Tag Support** — title, artist, album artist, track/disc numbers (including `x/y` fraction format and raw binary atoms), explicit/clean advisory badges
 - **Loose Artwork Fallback** — automatically finds `cover.jpg`, `folder.png`, and similar filenames in the track's directory if no embedded artwork is present
 - **Quality Tiers** — lossless (ALAC/FLAC), high (≥320 kbps), medium (≥192 kbps), low; color-coded in the track list
@@ -149,7 +149,7 @@ PureVibes is a personal project and its source is open to read. A few notable im
 ## Roadmap
 
 - [ ] Last.fm scrobbling
-- [ ] Gapless playback
+- [*] Gapless playback
 - [ ] Smart playlists / auto-queues based on tags or quality tier
 - [ ] Lyrics display (synced where available in metadata)
 - [ ] EQ / audio effects chain
