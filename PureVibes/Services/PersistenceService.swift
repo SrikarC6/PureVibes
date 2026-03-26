@@ -68,6 +68,7 @@ class PersistenceService {
             attribute("discNumber", .integer32AttributeType, optional: true),
             attribute("waveformData", .binaryDataAttributeType, optional: true),
             attribute("cachedAt", .dateAttributeType),
+            attribute("lastModified", .dateAttributeType, optional: true),
         ]
 
         // CachedFavorite entity
@@ -344,22 +345,35 @@ class PersistenceService {
                 context.reset()
                 
                 let now = Date()
-                for album in albums {
-                    let albumEntity = NSEntityDescription.insertNewObject(forEntityName: "CachedAlbum", into: context)
-                    albumEntity.setValue(album.title, forKey: "title")
-                    albumEntity.setValue(album.artist, forKey: "artist")
-                    if let albumArtist = album.albumArtist { albumEntity.setValue(albumArtist, forKey: "albumArtist") }
-                    albumEntity.setValue(now, forKey: "cachedAt")
-                    
-                    if let artwork = album.artwork, let tiff = artwork.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) {
-                        albumEntity.setValue(data, forKey: "artworkData")
+                for (index, album) in albums.enumerated() {
+                    // Wrap each album in autoreleasepool to free TIFF/JPEG intermediates
+                    autoreleasepool {
+                        let albumEntity = NSEntityDescription.insertNewObject(forEntityName: "CachedAlbum", into: context)
+                        albumEntity.setValue(album.title, forKey: "title")
+                        albumEntity.setValue(album.artist, forKey: "artist")
+                        if let albumArtist = album.albumArtist { albumEntity.setValue(albumArtist, forKey: "albumArtist") }
+                        albumEntity.setValue(now, forKey: "cachedAt")
+                        
+                        if let artwork = album.artwork, let tiff = artwork.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) {
+                            albumEntity.setValue(data, forKey: "artworkData")
+                        }
+                        
+                        for track in album.tracks {
+                            do {
+                                try self?.saveTrack(track, in: context, cachedAt: now)
+                            } catch {
+                                logger.error("Skipping track \(track.url.lastPathComponent): \(error.localizedDescription)")
+                            }
+                        }
                     }
-                    
-                    for track in album.tracks {
+
+                    // Periodic save every 20 albums to bound CoreData memory growth
+                    if (index + 1) % 20 == 0 {
                         do {
-                            try self?.saveTrack(track, in: context, cachedAt: now)
+                            try context.save()
+                            context.reset()
                         } catch {
-                            logger.error("Skipping track \(track.url.lastPathComponent): \(error.localizedDescription)")
+                            logger.error("Periodic save failed: \(error.localizedDescription)")
                         }
                     }
                 }
@@ -397,6 +411,11 @@ class PersistenceService {
         if let trackNum = track.trackNumber { entity.setValue(Int32(trackNum), forKey: "trackNumber") }
         if let discNum = track.discNumber { entity.setValue(Int32(discNum), forKey: "discNumber") }
         entity.setValue(cachedAt, forKey: "cachedAt")
+        // Store the file's filesystem modification date for incremental scanning
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: track.url.path),
+           let modDate = attrs[.modificationDate] as? Date {
+            entity.setValue(modDate, forKey: "lastModified")
+        }
     }
 
     func loadCachedAlbums() -> [Album]? {
@@ -418,7 +437,7 @@ class PersistenceService {
                       let cachedAt = tObj.value(forKey: "cachedAt") as? Date,
                       cachedAt > sevenDaysAgo else { continue }
                 
-                var track = Track(stubUrl: url)
+                var track = Track(url: url)
                 track.title = (tObj.value(forKey: "title") as? String) ?? track.title
                 track.artist = (tObj.value(forKey: "artist") as? String) ?? track.artist
                 track.album = (tObj.value(forKey: "album") as? String) ?? track.album
@@ -478,7 +497,7 @@ class PersistenceService {
                 return nil 
             }
             
-            var track = Track(stubUrl: trackUrl)
+            var track = Track(url: trackUrl)
             track.title = (tObj.value(forKey: "title") as? String) ?? track.title
             track.artist = (tObj.value(forKey: "artist") as? String) ?? track.artist
             track.album = (tObj.value(forKey: "album") as? String) ?? track.album
@@ -491,6 +510,100 @@ class PersistenceService {
             logger.error("Failed to load cached track: \(error.localizedDescription)")
             return nil
         }
+    }
+
+    // MARK: - Incremental Scanning
+
+    /// Compares filesystem modification dates against cached `lastModified` dates.
+    /// Returns URLs categorized as new, modified, or unchanged.
+    func detectNewAndModifiedFiles(allAudioURLs: [URL]) -> (new: [URL], modified: [URL], unchanged: [URL]) {
+        var newURLs: [URL] = []
+        var modifiedURLs: [URL] = []
+        var unchangedURLs: [URL] = []
+
+        let fetch = NSFetchRequest<NSManagedObject>(entityName: "CachedTrack")
+        do {
+            let cachedTracks = try context.fetch(fetch)
+            var cachedByURL: [String: NSManagedObject] = [:]
+            for obj in cachedTracks {
+                if let urlStr = obj.value(forKey: "url") as? String {
+                    cachedByURL[urlStr] = obj
+                }
+            }
+
+            for audioURL in allAudioURLs {
+                let urlStr = audioURL.absoluteString
+                if let cachedObj = cachedByURL[urlStr] {
+                    // File exists in cache — check if modified
+                    let cachedModDate = cachedObj.value(forKey: "lastModified") as? Date
+                    let fileModDate = (try? FileManager.default.attributesOfItem(atPath: audioURL.path))?[.modificationDate] as? Date
+
+                    if let cached = cachedModDate, let file = fileModDate, file > cached {
+                        modifiedURLs.append(audioURL)
+                    } else {
+                        unchangedURLs.append(audioURL)
+                    }
+                } else {
+                    // New file — not in cache
+                    newURLs.append(audioURL)
+                }
+            }
+        } catch {
+            logger.error("Failed to detect changes: \(error.localizedDescription)")
+            // If fetch fails, treat all as new
+            return (allAudioURLs, [], [])
+        }
+
+        logger.info("Incremental scan: \(newURLs.count) new, \(modifiedURLs.count) modified, \(unchangedURLs.count) unchanged")
+        return (newURLs, modifiedURLs, unchangedURLs)
+    }
+
+    /// Merges new albums into an existing album list without destroying existing album IDs.
+    /// Albums are matched by title+artist key. New albums are appended; modified ones update tracks.
+    func mergeNewAlbums(_ newAlbums: [Album], into existingAlbums: inout [Album]) {
+        for newAlbum in newAlbums {
+            let key = "\(newAlbum.title)||||\(newAlbum.artist)"
+            if let existingIdx = existingAlbums.firstIndex(where: { "\($0.title)||||\($0.artist)" == key }) {
+                // Update existing album: merge tracks
+                var existingTracks = existingAlbums[existingIdx].tracks
+                let existingURLs = Set(existingTracks.map { $0.url.absoluteString })
+                for track in newAlbum.tracks {
+                    if existingURLs.contains(track.url.absoluteString) {
+                        // Replace modified track
+                        if let trackIdx = existingTracks.firstIndex(where: { $0.url.absoluteString == track.url.absoluteString }) {
+                            existingTracks[trackIdx] = track
+                        }
+                    } else {
+                        existingTracks.append(track)
+                    }
+                }
+                // Re-sort by disc/track number
+                existingTracks.sort {
+                    let d1 = $0.discNumber ?? 1
+                    let d2 = $1.discNumber ?? 1
+                    if d1 != d2 { return d1 < d2 }
+                    return ($0.trackNumber ?? 0) < ($1.trackNumber ?? 0)
+                }
+                existingAlbums[existingIdx].tracks = existingTracks
+                // Update artwork if new album has it
+                if newAlbum.artwork != nil {
+                    // We can't mutate the let property, so we replace the album keeping the existing ID concept
+                    // Since Album uses UUID() at init, we create a new one but at the same index
+                    existingAlbums[existingIdx] = Album(
+                        title: existingAlbums[existingIdx].title,
+                        artist: existingAlbums[existingIdx].artist,
+                        albumArtist: existingAlbums[existingIdx].albumArtist,
+                        artwork: newAlbum.artwork,
+                        tracks: existingTracks
+                    )
+                }
+            } else {
+                // Brand new album
+                existingAlbums.append(newAlbum)
+            }
+        }
+        // Re-sort albums alphabetically
+        existingAlbums.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
     // MARK: - Purge

@@ -999,10 +999,18 @@ struct UtilityPill: View {
                 Image(systemName: showFavorites ? "star.square.fill" : "star.square").font(.system(size: 16)).foregroundColor(showFavorites ? .accentColor : .secondary)
             }.buttonStyle(.plain)
             
-            // 4. Divider
+            // 4. Refresh Library
+            Button(action: {
+                NotificationCenter.default.post(name: .menuRefreshLibrary, object: nil)
+            }) {
+                Image(systemName: "arrow.clockwise").font(.system(size: 16)).foregroundColor(.secondary)
+            }.buttonStyle(.plain)
+            .help("Refresh Library")
+            
+            // 5. Divider
             Divider().frame(height: 16).background(Color.white.opacity(0.2))
             
-            // 5. Open Directory
+            // 6. Open Directory
             Button(action: openDirectories) {
                 Image(systemName: "folder.badge.plus").font(.system(size: 16)).foregroundColor(.secondary)
             }.buttonStyle(.plain)
@@ -1694,6 +1702,9 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .menuPurgeCache)) { _ in
             PersistenceService.shared.purgeAllCache()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .menuRefreshLibrary)) { _ in
+            refreshLibrary()
+        }
     }
     private var pillScale: CGFloat { NSApp.keyWindow?.frame.height ?? 700 < 600 ? 0.8 : 1.0 }
     private var currentArtwork: NSImage? {
@@ -1731,20 +1742,17 @@ struct ContentView: View {
             }
 
             if let cachedAlbums = PersistenceService.shared.loadCachedAlbums() {
-                var allTracks: [Track] = []
                 for album in cachedAlbums {
-                    allTracks.append(contentsOf: album.tracks)
                     if let art = album.artwork {
                         ArtworkCache.shared.setArtwork(art, forAlbumID: album.id)
                     }
                 }
 
                 await MainActor.run {
-                    player.allTracks = allTracks
                     player.albums = cachedAlbums
                     player.isLoadingLibrary = false
                     focusedAlbumID = cachedAlbums.first?.id
-                    if allTracks.count > 500 { ArtworkCache.shared.trimToHalf() }
+                    if player.allTracks.count > 500 { ArtworkCache.shared.trimToHalf() }
                 }
             } else {
                 // No valid cache — fall back to a full re-scan using saved bookmarks.
@@ -1767,7 +1775,7 @@ struct ContentView: View {
             player.isLoadingLibrary = true
             player.loadedTrackCount = 0
 
-            // 2. Enumerate audio files on a background thread
+            // Phase 1: Enumerate audio files on a background thread
             let audioURLs: [URL] = await Task.detached(priority: .userInitiated) {
                 urls.flatMap { baseURL -> [URL] in
                     guard let en = FileManager.default.enumerator(
@@ -1781,61 +1789,57 @@ struct ContentView: View {
             }.value
 
             player.totalTrackCount = audioURLs.count
-            
-            // Phase 1: Create stubs
-            let stubs = audioURLs.map { TrackStub(url: $0) }
-            await MainActor.run { player.allStubs = stubs }
-            
-            // Phase 2/3: Resolve stubs with cache or full load (max 4 concurrent)
+
+            // Phase 2: Load metadata-only (NO artwork) with concurrency throttle
             let maxConcurrency = 4
             var allTracks: [Track] = []
             allTracks.reserveCapacity(audioURLs.count)
 
-            await withTaskGroup(of: Track?.self) { group in
+            await withTaskGroup(of: Track.self) { group in
                 var submitted = 0
 
-                while submitted < min(maxConcurrency, stubs.count) {
-                    let stub = stubs[submitted]
-                    group.addTask { await self.player.resolve(stub) }
+                while submitted < min(maxConcurrency, audioURLs.count) {
+                    let url = audioURLs[submitted]
+                    group.addTask { await Track.loadMetadataOnly(from: url) }
                     submitted += 1
                 }
 
                 for await track in group {
-                    if let t = track { allTracks.append(t) }
+                    allTracks.append(track)
 
                     let loaded = allTracks.count
-                    if loaded % 50 == 0 || loaded == stubs.count {
+                    if loaded % 50 == 0 || loaded == audioURLs.count {
                         await MainActor.run { player.loadedTrackCount = loaded }
                     }
 
-                    if submitted < stubs.count {
-                        let stub = stubs[submitted]
-                        group.addTask { await self.player.resolve(stub) }
+                    if submitted < audioURLs.count {
+                        let url = audioURLs[submitted]
+                        group.addTask { await Track.loadMetadataOnly(from: url) }
                         submitted += 1
                     }
                 }
             }
 
-            // Group into albums
+            // Phase 3: Group into albums (tracks have NO artwork at this point)
             var albums = groupTracksIntoAlbums(allTracks)
 
-            // Populate ArtworkCache
-            for album in albums {
-                if let art = album.artwork {
-                    ArtworkCache.shared.setArtwork(art, forAlbumID: album.id)
+            // Phase 4: Extract artwork once per album (from first track's embedded or loose)
+            // This is N_albums extractions instead of N_tracks — typically 10-12x fewer
+            for i in albums.indices {
+                if albums[i].artwork == nil, let firstTrack = albums[i].tracks.first {
+                    let artwork = await Track.extractArtwork(from: firstTrack.url)
+                    albums[i] = Album(
+                        title: albums[i].title,
+                        artist: albums[i].artist,
+                        albumArtist: albums[i].albumArtist,
+                        artwork: artwork,
+                        tracks: albums[i].tracks
+                    )
                 }
-            }
-
-            // Nil out per-track artwork to reclaim memory safely matching Album assert
-            for i in allTracks.indices {
-                allTracks[i].artwork = nil
-            }
-            for albumIdx in albums.indices {
-                var updatedTracks = albums[albumIdx].tracks
-                for trackIdx in updatedTracks.indices {
-                    updatedTracks[trackIdx].artwork = nil
+                // Populate ArtworkCache immediately per-album to limit peak memory
+                if let art = albums[i].artwork {
+                    ArtworkCache.shared.setArtwork(art, forAlbumID: albums[i].id)
                 }
-                albums[albumIdx].tracks = updatedTracks
             }
 
             // Async save to cache
@@ -1843,11 +1847,10 @@ struct ContentView: View {
 
             // Update UI on main actor
             await MainActor.run {
-                player.allTracks = allTracks
                 player.albums = albums
                 player.isLoadingLibrary = false
                 focusedAlbumID = albums.first?.id
-                if allTracks.count > 500 { ArtworkCache.shared.trimToHalf() }
+                if player.allTracks.count > 500 { ArtworkCache.shared.trimToHalf() }
             }
         }
     }
@@ -1877,7 +1880,10 @@ struct ContentView: View {
                 return ($0.trackNumber ?? 0) < ($1.trackNumber ?? 0)
             }
             if let first = sorted.first {
-                let artwork = first.artwork
+                // During bulk load, tracks have no artwork —
+                // artwork is extracted per-album in Phase 4 of loadAlbums.
+                // But for refreshLibrary/single-track loads, artwork may be present.
+                let artwork = sorted.first(where: { $0.artwork != nil })?.artwork
                 let cleanTracks = sorted.map { track -> Track in
                     var t = track
                     t.artwork = nil
@@ -1894,6 +1900,96 @@ struct ContentView: View {
         }
         return albums.sorted {
             $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    private func refreshLibrary() {
+        guard !player.isLoadingLibrary else { return }
+        Task {
+            player.isLoadingLibrary = true
+            let bookmarkURLs = PersistenceService.shared.activeBookmarks
+
+            guard !bookmarkURLs.isEmpty else {
+                await MainActor.run { player.isLoadingLibrary = false }
+                return
+            }
+
+            // Scan for all audio files
+            let allAudioURLs: [URL] = await Task.detached(priority: .userInitiated) {
+                bookmarkURLs.flatMap { baseURL -> [URL] in
+                    guard let en = FileManager.default.enumerator(
+                        at: baseURL,
+                        includingPropertiesForKeys: [.contentTypeKey]
+                    ) else { return [] }
+                    return (en.allObjects as? [URL] ?? []).filter { file in
+                        (try? file.resourceValues(forKeys: [.contentTypeKey]).contentType)?.conforms(to: .audio) == true
+                    }
+                }
+            }.value
+
+            // Diff against cached tracks
+            let (newURLs, modifiedURLs, _) = PersistenceService.shared.detectNewAndModifiedFiles(
+                allAudioURLs: allAudioURLs
+            )
+
+            guard !newURLs.isEmpty || !modifiedURLs.isEmpty else {
+                await MainActor.run { player.isLoadingLibrary = false }
+                return
+            }
+
+            // Only process changed/new files
+            let urlsToProcess = newURLs + modifiedURLs
+            player.totalTrackCount = urlsToProcess.count
+            player.loadedTrackCount = 0
+
+            var newTracks: [Track] = []
+            newTracks.reserveCapacity(urlsToProcess.count)
+
+            let maxConcurrency = 4
+            await withTaskGroup(of: Track.self) { group in
+                var submitted = 0
+                while submitted < min(maxConcurrency, urlsToProcess.count) {
+                    let url = urlsToProcess[submitted]
+                    group.addTask { await Track.loadFullMetadata(from: url) }
+                    submitted += 1
+                }
+
+                for await track in group {
+                    newTracks.append(track)
+                    let loaded = newTracks.count
+                    if loaded % 20 == 0 || loaded == urlsToProcess.count {
+                        await MainActor.run { player.loadedTrackCount = loaded }
+                    }
+                    if submitted < urlsToProcess.count {
+                        let url = urlsToProcess[submitted]
+                        group.addTask { await Track.loadFullMetadata(from: url) }
+                        submitted += 1
+                    }
+                }
+            }
+
+            // Group new tracks into albums and merge
+            let newAlbums = groupTracksIntoAlbums(newTracks)
+
+            // Populate ArtworkCache for new albums
+            for album in newAlbums {
+                if let art = album.artwork {
+                    ArtworkCache.shared.setArtwork(art, forAlbumID: album.id)
+                }
+            }
+
+            await MainActor.run {
+                var updatedAlbums = player.albums
+                PersistenceService.shared.mergeNewAlbums(
+                    newAlbums,
+                    into: &updatedAlbums
+                )
+                player.albums = updatedAlbums
+                player.isLoadingLibrary = false
+
+                // Re-cache everything
+                PersistenceService.shared.saveAlbums(updatedAlbums)
+            }
         }
     }
 }
@@ -1916,6 +2012,7 @@ extension NSNotification.Name {
     static let menuToggleGrid     = NSNotification.Name("pv.menu.toggleGrid")
     static let menuToggleFavorites = NSNotification.Name("pv.menu.toggleFavorites")
     static let menuPurgeCache     = NSNotification.Name("pv.menu.purgeCache")
+    static let menuRefreshLibrary = NSNotification.Name("pv.menu.refreshLibrary")
 }
 
 @main 
@@ -2004,6 +2101,11 @@ struct MusicPlayerApp: App {
 
             // Library Menu
             CommandMenu("Library") {
+                Button("Refresh Library") {
+                    NotificationCenter.default.post(name: .menuRefreshLibrary, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: .command)
+
                 Button("Purge All Cache") {
                     NotificationCenter.default.post(name: .menuPurgeCache, object: nil)
                 }

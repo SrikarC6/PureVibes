@@ -38,29 +38,10 @@ class MusicPlayer: ObservableObject {
     }
     
     @Published var albums: [Album] = []
-    @Published var allTracks: [Track] = []
-    
-    @Published var allStubs: [TrackStub] = []
-    private var resolvedCache: [UUID: Track] = [:]
-    private var resolvedCacheOrder: [UUID] = []
-    
-    func resolve(_ stub: TrackStub) async -> Track {
-        if let cached = resolvedCache[stub.id] { return cached }
-        
-        let track: Track
-        if let coreDataTrack = await PersistenceService.shared.loadCachedTrack(url: stub.url.absoluteString) {
-            track = coreDataTrack
-        } else {
-            track = await Track.load(from: stub.url)
-        }
-        
-        resolvedCache[stub.id] = track
-        resolvedCacheOrder.append(stub.id)
-        if resolvedCache.count > 100 {
-            let oldestKey = resolvedCacheOrder.removeFirst()
-            resolvedCache.removeValue(forKey: oldestKey)
-        }
-        return track
+
+    /// Derived from albums — no duplicate storage. Avoids doubling memory for track data.
+    var allTracks: [Track] {
+        albums.flatMap { $0.tracks }
     }
 
     // Performance-aware animation resolution

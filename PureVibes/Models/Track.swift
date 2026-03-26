@@ -59,48 +59,162 @@ struct Track: Identifiable, Hashable {
         return Track.sharedByteFormatter.string(fromByteCount: fileSize)
     }
     
+    /// Lightweight initializer — NO metadata extraction. Just path + filename.
+    /// This is the primary init used during library scanning to avoid AVAsset overhead.
     init(url: URL) {
         self.url = url
-        let asset = AVAsset(url: url)
-        let metadata = asset.metadata
-        self.title = metadata.first(where: { $0.commonKey == .commonKeyTitle })?.stringValue ?? url.deletingPathExtension().lastPathComponent
-        self.artist = metadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue ?? "Unknown Artist"
-        self.album = metadata.first(where: { $0.commonKey == .commonKeyAlbumName })?.stringValue ?? "Unknown Album"
-        
-        var foundArt: NSImage? = nil
-        if let item = metadata.first(where: { $0.commonKey == .commonKeyArtwork }), let data = item.dataValue ?? item.value as? Data {
-            foundArt = NSImage(data: data)
-        }
-        if foundArt == nil {
-            for item in metadata {
-                let id = item.identifier?.rawValue ?? ""
-                if id.contains("covr") || id.contains("APIC") || id.contains("artwork") {
-                    if let data = item.dataValue ?? item.value as? Data {
+        self.title = url.deletingPathExtension().lastPathComponent
+        let components = url.pathComponents
+        let albumComponent = components.count >= 3 ? components[components.count - 2] : nil
+        let artistComponent = components.count >= 4 ? components[components.count - 3] : nil
+        self.album = (albumComponent.flatMap { $0 == "/" ? nil : $0 }) ?? "Unknown Album"
+        self.artist = (artistComponent.flatMap { $0 == "/" ? nil : $0 }) ?? "Unknown Artist"
+    }
+
+    /// Full metadata load — called on-demand, NOT during library scan.
+    /// Uses an autoreleasepool to ensure AVAsset is freed immediately after extraction.
+    static func loadFullMetadata(from url: URL) async -> Track {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                autoreleasepool {
+                    var track = Track(url: url)
+                    let asset = AVURLAsset(url: url, options: [
+                        AVURLAssetPreferPreciseDurationAndTimingKey: false
+                    ])
+
+                    let metadata = asset.metadata
+
+                    // Extract text metadata
+                    track.title = metadata.first(where: { $0.commonKey == .commonKeyTitle })?.stringValue
+                        ?? url.deletingPathExtension().lastPathComponent
+                    track.artist = metadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
+                        ?? track.artist
+                    track.album = metadata.first(where: { $0.commonKey == .commonKeyAlbumName })?.stringValue
+                        ?? track.album
+
+                    // Extract artwork
+                    var foundArt: NSImage? = nil
+                    if let item = metadata.first(where: { $0.commonKey == .commonKeyArtwork }),
+                       let data = item.dataValue ?? item.value as? Data {
                         foundArt = NSImage(data: data)
-                        if foundArt != nil { break }
                     }
+                    if foundArt == nil {
+                        for item in metadata {
+                            let id = item.identifier?.rawValue ?? ""
+                            if id.contains("covr") || id.contains("APIC") || id.contains("artwork") {
+                                if let data = item.dataValue ?? item.value as? Data {
+                                    foundArt = NSImage(data: data)
+                                    if foundArt != nil { break }
+                                }
+                            }
+                        }
+                    }
+                    if foundArt == nil { foundArt = Track.findLooseArtwork(near: url) }
+                    track.artwork = foundArt.flatMap { Track.downscale($0, maxSize: 400) }
+
+                    // Extract track/disc numbers
+                    track.extractTrackAndDiscNumbers(from: metadata, url: url)
+
+                    // Extract audio format info
+                    track.extractAudioFormatInfo(from: asset, url: url)
+                    track.extractiTunesMetadata(from: metadata)
+
+                    continuation.resume(returning: track)
                 }
             }
         }
-        if foundArt == nil { foundArt = Track.findLooseArtwork(near: url) }
-        // Downscale to max 400px to avoid massive RAM usage on large libraries
-        self.artwork = foundArt.flatMap { Track.downscale($0, maxSize: 400) }
+    }
+
+    /// Metadata-only load — NO artwork extraction. Used during bulk library scanning
+    /// to avoid the massive memory spike from decoding artwork for every track.
+    /// Artwork is extracted separately, once per album, after grouping.
+    static func loadMetadataOnly(from url: URL) async -> Track {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                autoreleasepool {
+                    var track = Track(url: url)
+                    let asset = AVURLAsset(url: url, options: [
+                        AVURLAssetPreferPreciseDurationAndTimingKey: false
+                    ])
+
+                    let metadata = asset.metadata
+
+                    // Extract text metadata only
+                    track.title = metadata.first(where: { $0.commonKey == .commonKeyTitle })?.stringValue
+                        ?? url.deletingPathExtension().lastPathComponent
+                    track.artist = metadata.first(where: { $0.commonKey == .commonKeyArtist })?.stringValue
+                        ?? track.artist
+                    track.album = metadata.first(where: { $0.commonKey == .commonKeyAlbumName })?.stringValue
+                        ?? track.album
+
+                    // NO artwork extraction — that happens per-album after grouping
+
+                    // Extract track/disc numbers
+                    track.extractTrackAndDiscNumbers(from: metadata, url: url)
+
+                    // Extract audio format info
+                    track.extractAudioFormatInfo(from: asset, url: url)
+                    track.extractiTunesMetadata(from: metadata)
+
+                    continuation.resume(returning: track)
+                }
+            }
+        }
+    }
+
+    /// Extract artwork from a single audio file URL. Used once per album after grouping.
+    /// Returns a downscaled NSImage or nil. Wrapped in autoreleasepool.
+    static func extractArtwork(from url: URL) async -> NSImage? {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                autoreleasepool {
+                    let asset = AVURLAsset(url: url, options: [
+                        AVURLAssetPreferPreciseDurationAndTimingKey: false
+                    ])
+                    let metadata = asset.metadata
+
+                    var foundArt: NSImage? = nil
+                    if let item = metadata.first(where: { $0.commonKey == .commonKeyArtwork }),
+                       let data = item.dataValue ?? item.value as? Data {
+                        foundArt = NSImage(data: data)
+                    }
+                    if foundArt == nil {
+                        for item in metadata {
+                            let id = item.identifier?.rawValue ?? ""
+                            if id.contains("covr") || id.contains("APIC") || id.contains("artwork") {
+                                if let data = item.dataValue ?? item.value as? Data {
+                                    foundArt = NSImage(data: data)
+                                    if foundArt != nil { break }
+                                }
+                            }
+                        }
+                    }
+                    if foundArt == nil { foundArt = Track.findLooseArtwork(near: url) }
+                    let result = foundArt.flatMap { Track.downscale($0, maxSize: 400) }
+                    continuation.resume(returning: result)
+                }
+            }
+        }
+    }
+
+    // MARK: - Metadata Extraction Helpers
+
+    private mutating func extractTrackAndDiscNumbers(from metadata: [AVMetadataItem], url: URL) {
         // Disc Number extraction
-        if let discItem = metadata.first(where: { $0.commonKey?.rawValue == "discNumber" }) ?? 
+        if let discItem = metadata.first(where: { $0.commonKey?.rawValue == "discNumber" }) ??
                           metadata.first(where: { $0.identifier?.rawValue == "TPOS" }) ??
                           metadata.first(where: { $0.identifier?.rawValue == "disk" }) {
             if let stringVal = discItem.stringValue {
-                // Handle "1/2" format
                 let components = stringVal.components(separatedBy: "/")
                 if let first = components.first, let num = Int(first) { self.discNumber = num }
             } else if let numVal = discItem.numberValue {
                 self.discNumber = numVal.intValue
             } else if let data = discItem.dataValue, data.count >= 6 {
-                 let discIndex = Int(data[3])
-                 if discIndex > 0 { self.discNumber = discIndex }
+                let discIndex = Int(data[3])
+                if discIndex > 0 { self.discNumber = discIndex }
             }
         }
-        
+
         // Fallback: Check file path for "CD1", "Disc 1", "Part 1" patterns
         if self.discNumber == nil {
             let path = url.path
@@ -112,23 +226,20 @@ struct Track: Identifiable, Hashable {
                 self.discNumber = num
             }
         }
-        
+
         // Track Number extraction (robust)
         if let trackItem = metadata.first(where: { $0.commonKey?.rawValue == "trackNumber" }) ??
                            metadata.first(where: { $0.identifier?.rawValue == "TRCK" }) ??
                            metadata.first(where: { $0.identifier?.rawValue == "trkn" }) {
-             if let stringVal = trackItem.stringValue {
-                 let components = stringVal.components(separatedBy: "/")
-                 if let first = components.first, let num = Int(first) { self.trackNumber = num }
-             } else if let numVal = trackItem.numberValue {
-                 self.trackNumber = numVal.intValue
-             }
+            if let stringVal = trackItem.stringValue {
+                let components = stringVal.components(separatedBy: "/")
+                if let first = components.first, let num = Int(first) { self.trackNumber = num }
+            } else if let numVal = trackItem.numberValue {
+                self.trackNumber = numVal.intValue
+            }
         }
-
-        extractAudioFormatInfo(from: asset, url: url)
-        extractiTunesMetadata(from: metadata)
     }
-    
+
     private static func findLooseArtwork(near url: URL) -> NSImage? {
         let dir = url.deletingLastPathComponent()
         let names = ["cover", "folder", "album", "front", "artwork"]
@@ -136,7 +247,7 @@ struct Track: Identifiable, Hashable {
         for name in names { for ext in exts { let file = dir.appendingPathComponent("\(name).\(ext)"); if FileManager.default.fileExists(atPath: file.path) { return NSImage(contentsOf: file) } } }
         return nil
     }
-    
+
     /// Downscale an image to fit within maxSize×maxSize. Returns original if already small enough.
     private static func downscale(_ image: NSImage, maxSize: CGFloat) -> NSImage {
         let w = image.size.width
@@ -152,7 +263,7 @@ struct Track: Identifiable, Hashable {
         resized.unlockFocus()
         return resized
     }
-    
+
     private mutating func extractAudioFormatInfo(from asset: AVAsset, url: URL) {
         if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
            let size = attributes[.size] as? Int64 { self.fileSize = size }
@@ -177,7 +288,7 @@ struct Track: Identifiable, Hashable {
             }
         }
     }
-    
+
     private mutating func extractiTunesMetadata(from metadata: [AVMetadataItem]) {
         var hasFlvr2 = false, hasAppleID = false, hasCatalogNumber = false, hasOwner = false
         for item in metadata {
@@ -202,25 +313,18 @@ struct Track: Identifiable, Hashable {
         }
         if hasFlvr2 || (hasAppleID && hasCatalogNumber) || hasOwner { self.isAppleDigitalMaster = true }
     }
-    
+
     static func == (lhs: Track, rhs: Track) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
-    
-    /// Async factory — identical to `init(url:)`, callable from TaskGroup for parallel loading.
+
+    /// Async factory — uses full metadata extraction with autoreleasepool.
     static func load(from url: URL) async -> Track {
-        Track(url: url)
+        await loadFullMetadata(from: url)
     }
-    
-    /// Lightweight initializer for generating Track from Cache without AVAsset payload 
+
+    /// Backward-compatible alias for lightweight init (identical to init(url:) now).
     init(stubUrl url: URL) {
-        self.url = url
-        self.title = url.deletingPathExtension().lastPathComponent
-        let components = url.pathComponents
-        // components[0] is always "/" on macOS — need at least 3 components for album, 4 for artist
-        let albumComponent = components.count >= 3 ? components[components.count - 2] : nil
-        let artistComponent = components.count >= 4 ? components[components.count - 3] : nil
-        self.album = (albumComponent.flatMap { $0 == "/" ? nil : $0 }) ?? "Unknown Album"
-        self.artist = (artistComponent.flatMap { $0 == "/" ? nil : $0 }) ?? "Unknown Artist"
+        self.init(url: url)
     }
 }
 
