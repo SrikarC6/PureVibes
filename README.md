@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![Latest Release](https://img.shields.io/github/v/release/SrikarC6/PureVibes?label=latest&color=brightgreen)](https://github.com/SrikarC6/PureVibes/releases/latest)
 
-[⬇️ Download Latest Release](https://github.com/SrikarC6/PureVibes/releases/latest) · [📋 Changelog](CHANGELOG.md) · [🐛 Report a Bug](https://github.com/SrikarC6/PureVibes/issues/new?template=bug_report.md)
+[⬇️ Download Latest Release](https://github.com/SrikarC6/PureVibes/releases/latest) · [🐛 Report a Bug](https://github.com/SrikarC6/PureVibes/issues/new?template=bug_report.md)
 
 </div>
 
