@@ -220,10 +220,9 @@ struct QueuePopupView: View {
             if let current = player.currentTrack {
                 HStack(spacing: 12) {
                     // Use ArtworkCache via album lookup for queue popup artwork
-                    if let album = player.albumForCurrentTrack(), let artwork = ArtworkCache.shared.thumbnail(forAlbumID: album.id, maxSize: 44) ?? album.artwork?.thumbnail() {
+                    if let album = player.albumForCurrentTrack(), let artwork = ArtworkCache.shared.thumbnail(forAlbumID: album.id, maxSize: 44) {
                         Image(nsImage: artwork).resizable().aspectRatio(contentMode: .fill).frame(width: 44, height: 44).cornerRadius(8)
-                    } else if let artwork = current.artwork { Image(nsImage: artwork.thumbnail()).resizable().aspectRatio(contentMode: .fill).frame(width: 44, height: 44).cornerRadius(8) }
-                    else { RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.1)).frame(width: 44, height: 44) }
+                    } else { RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.1)).frame(width: 44, height: 44) }
                     VStack(alignment: .leading, spacing: 2) { HStack(spacing: 6) { Text(current.title).font(.custom("Baskerville", size: 15).bold()).foregroundColor(.accentColor).lineLimit(1); if current.itunesAdvisory == "Explicit" { ExplicitBadge() } }; Text(current.artist).font(.system(size: 12, design: .monospaced)).foregroundColor(.secondary).lineLimit(1) }
                     Spacer(); Image(systemName: "speaker.wave.3.fill").font(.caption).foregroundColor(.accentColor).symbolEffect(.bounce, value: player.isPlaying)
                 }.padding(16).background(Color.white.opacity(0.05))
@@ -758,8 +757,8 @@ struct MiniPlayerPill: View {
                 // 1. Album Art Spinner — uses ArtworkCache thumbnail for efficiency
                 ZStack { 
                     if let album = player.albumForCurrentTrack(),
-                       let artwork = ArtworkCache.shared.thumbnail(forAlbumID: album.id, maxSize: 46) ?? album.artwork?.thumbnail() {
-                        TimelineView(.animation(minimumInterval: 1.0/30.0, paused: !player.isPlaying || player.isScrubbing)) { context in
+                       let artwork = ArtworkCache.shared.thumbnail(forAlbumID: album.id, maxSize: 46) {
+                        TimelineView(.animation(minimumInterval: 1.0/30.0, paused: !player.isPlaying || player.isScrubbing || !AppActivityMonitor.shared.shouldAnimate)) { context in
                             Image(nsImage: artwork).resizable().aspectRatio(contentMode: .fill).frame(width: 46, height: 46).clipShape(Circle())
                                 .rotationEffect(.degrees(rotation))
                                 .onChange(of: context.date) { newDate in
@@ -1283,8 +1282,8 @@ struct AlbumCardView: View {
         GeometryReader { geo in
             ZStack {
                 Group {
-                    // Read artwork from ArtworkCache first, fall back to album.artwork
-                    if let artwork = ArtworkCache.shared.artwork(forAlbumID: album.id) ?? album.artwork {
+                    // Read artwork exclusively from ArtworkCache
+                    if let artwork = ArtworkCache.shared.artwork(forAlbumID: album.id) {
                         Image(nsImage: artwork)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
@@ -1420,7 +1419,7 @@ struct StrobingButton: View {
 
 struct CloudView: View {
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 15.0)) { context in
+        TimelineView(.animation(minimumInterval: 1.0 / 15.0, paused: !AppActivityMonitor.shared.shouldAnimate)) { context in
             let interval: Double = context.date.timeIntervalSinceReferenceDate
             let remainder: Double = interval.truncatingRemainder(dividingBy: 30.0)
             let phase: CGFloat = CGFloat(remainder) * (.pi * 2.0 / 30.0)
@@ -1503,9 +1502,9 @@ struct ContentView: View {
             // Background Theme Logic
             Color.black.ignoresSafeArea() // OLED Base
             
-            if player.effectiveBlurEnabled, let artwork = currentArtwork { 
+            if player.effectiveBlurEnabled, let blurArtwork = currentBlurThumbnail { 
                 GeometryReader { geo in 
-                    Image(nsImage: artwork.thumbnail(maxSize: 100))
+                    Image(nsImage: blurArtwork)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geo.size.width, height: geo.size.height)
@@ -1707,12 +1706,15 @@ struct ContentView: View {
         }
     }
     private var pillScale: CGFloat { NSApp.keyWindow?.frame.height ?? 700 < 600 ? 0.8 : 1.0 }
-    private var currentArtwork: NSImage? {
-        // Read from ArtworkCache first, then fall back to album.artwork
-        if let focusedID = focusedAlbumID, let album = player.albums.first(where: { $0.id == focusedID }) {
-            return ArtworkCache.shared.artwork(forAlbumID: album.id) ?? album.artwork
+    /// Background blur thumbnail — uses ArtworkCache thumbnails exclusively.
+    private var currentBlurThumbnail: NSImage? {
+        if let focusedID = focusedAlbumID {
+            return ArtworkCache.shared.thumbnail(forAlbumID: focusedID, maxSize: 100)
         }
-        return player.artworkForCurrentTrack()
+        if let album = player.albumForCurrentTrack() {
+            return ArtworkCache.shared.thumbnail(forAlbumID: album.id, maxSize: 100)
+        }
+        return nil
     }
     private func openDirectories() {
         let panel = NSOpenPanel()
@@ -1721,42 +1723,59 @@ struct ContentView: View {
         if panel.runModal() == .OK {
             let selectedURLs = panel.urls
             PersistenceService.shared.activeBookmarks = selectedURLs
+            // Use SecurityScopeManager for balanced access
+            SecurityScopeManager.shared.replaceAll(with: selectedURLs)
             for url in selectedURLs {
                 PersistenceService.shared.saveBookmark(for: url)
-                _ = url.startAccessingSecurityScopedResource()
             }
             loadAlbums(from: selectedURLs)
         }
     }
     private func loadCachedLibrary() {
         Task {
-            // Re-establish sandbox access for all saved bookmark directories.
-            // This MUST happen before any file reads (playback, artwork, etc.)
-            // because the app is sandboxed with user-selected.read-only entitlement.
-            // Without startAccessingSecurityScopedResource(), AVAudioPlayer silently
-            // fails on every cached track URL.
+            // Re-establish sandbox access using SecurityScopeManager (balanced start/stop).
             let bookmarkURLs = PersistenceService.shared.loadBookmarks()
             PersistenceService.shared.activeBookmarks = bookmarkURLs
-            for url in bookmarkURLs {
-                _ = url.startAccessingSecurityScopedResource()
-            }
+            SecurityScopeManager.shared.replaceAll(with: bookmarkURLs)
 
-            if let cachedAlbums = PersistenceService.shared.loadCachedAlbums() {
-                for album in cachedAlbums {
-                    if let art = album.artwork {
-                        ArtworkCache.shared.setArtwork(art, forAlbumID: album.id)
+            if let result = PersistenceService.shared.loadCachedAlbums() {
+                // Populate ArtworkCache from compressed data stored in the database
+                ArtworkCache.shared.populate(fromDataEntries: result.artworkEntries)
+
+                // Identify albums that have no artwork in the database and re-extract
+                let albumsWithArtwork = Set(result.artworkEntries.map { $0.albumID })
+                let albumsMissingArtwork = result.albums.filter { !albumsWithArtwork.contains($0.id) }
+
+                if !albumsMissingArtwork.isEmpty {
+                    logger.info("Re-extracting artwork for \(albumsMissingArtwork.count) albums missing from cache")
+                    var reExtracted: [UUID: Data] = [:]
+                    for album in albumsMissingArtwork {
+                        for track in album.tracks.prefix(3) {
+                            if let artData = await Track.extractArtworkData(from: track.url) {
+                                ArtworkCache.shared.setArtwork(data: artData, forAlbumID: album.id, maxPixelSize: 400)
+                                reExtracted[album.id] = artData
+                                break
+                            }
+                        }
+                    }
+                    // Re-save with the newly extracted artwork so it persists for next launch
+                    if !reExtracted.isEmpty {
+                        // Merge with existing artwork entries
+                        var allArtwork = Dictionary(uniqueKeysWithValues: result.artworkEntries.map { ($0.albumID, $0.data) })
+                        allArtwork.merge(reExtracted) { _, new in new }
+                        PersistenceService.shared.saveAlbums(result.albums, artworkData: allArtwork)
+                        logger.info("Re-persisted \(reExtracted.count) artwork entries")
                     }
                 }
 
                 await MainActor.run {
-                    player.albums = cachedAlbums
+                    player.albums = result.albums
                     player.isLoadingLibrary = false
-                    focusedAlbumID = cachedAlbums.first?.id
+                    focusedAlbumID = result.albums.first?.id
                     if player.allTracks.count > 500 { ArtworkCache.shared.trimToHalf() }
                 }
             } else {
                 // No valid cache — fall back to a full re-scan using saved bookmarks.
-                // This handles the case where cache is empty/expired but bookmarks exist.
                 if !bookmarkURLs.isEmpty {
                     await MainActor.run {
                         loadAlbums(from: bookmarkURLs)
@@ -1823,27 +1842,32 @@ struct ContentView: View {
             // Phase 3: Group into albums (tracks have NO artwork at this point)
             var albums = groupTracksIntoAlbums(allTracks)
 
-            // Phase 4: Extract artwork once per album (from first track's embedded or loose)
-            // This is N_albums extractions instead of N_tracks — typically 10-12x fewer
+            // Phase 4: Extract artwork DATA once per album (try multiple tracks if first has none)
+            // Collect into a dictionary so we can pass it directly to saveAlbums —
+            // we CANNOT rely on ArtworkCache.artworkData() because NSCache auto-evicts
+            // entries under memory pressure before saveAlbums gets to read them.
+            var artworkDataByAlbumID: [UUID: Data] = [:]
             for i in albums.indices {
-                if albums[i].artwork == nil, let firstTrack = albums[i].tracks.first {
-                    let artwork = await Track.extractArtwork(from: firstTrack.url)
-                    albums[i] = Album(
-                        title: albums[i].title,
-                        artist: albums[i].artist,
-                        albumArtist: albums[i].albumArtist,
-                        artwork: artwork,
-                        tracks: albums[i].tracks
-                    )
+                var foundArt = false
+                for track in albums[i].tracks.prefix(3) {
+                    if let artData = await Track.extractArtworkData(from: track.url) {
+                        // Populate ArtworkCache for display (normalizes to JPEG internally)
+                        ArtworkCache.shared.setArtwork(data: artData, forAlbumID: albums[i].id, maxPixelSize: 400)
+                        // Store the normalized JPEG for persistence (not the raw 1-2MB blob)
+                        if let normalized = ArtworkCache.shared.artworkData(forAlbumID: albums[i].id) {
+                            artworkDataByAlbumID[albums[i].id] = normalized
+                        }
+                        foundArt = true
+                        break
+                    }
                 }
-                // Populate ArtworkCache immediately per-album to limit peak memory
-                if let art = albums[i].artwork {
-                    ArtworkCache.shared.setArtwork(art, forAlbumID: albums[i].id)
+                if !foundArt {
+                    logger.info("No artwork found for album: \(albums[i].title)")
                 }
             }
 
-            // Async save to cache
-            PersistenceService.shared.saveAlbums(albums)
+            // Async save to cache — pass artwork data directly, don't read from volatile NSCache
+            PersistenceService.shared.saveAlbums(albums, artworkData: artworkDataByAlbumID)
 
             // Update UI on main actor
             await MainActor.run {
@@ -1880,21 +1904,13 @@ struct ContentView: View {
                 return ($0.trackNumber ?? 0) < ($1.trackNumber ?? 0)
             }
             if let first = sorted.first {
-                // During bulk load, tracks have no artwork —
-                // artwork is extracted per-album in Phase 4 of loadAlbums.
-                // But for refreshLibrary/single-track loads, artwork may be present.
-                let artwork = sorted.first(where: { $0.artwork != nil })?.artwork
-                let cleanTracks = sorted.map { track -> Track in
-                    var t = track
-                    t.artwork = nil
-                    return t
-                }
+                // Track models no longer carry artwork — artwork lives in ArtworkCache only.
                 albums.append(Album(
                     title: albumName,
                     artist: finalArtist,
                     albumArtist: finalArtist,
-                    artwork: artwork,
-                    tracks: cleanTracks
+                    artworkSourceURL: first.url,
+                    tracks: sorted
                 ))
             }
         }
@@ -1950,7 +1966,7 @@ struct ContentView: View {
                 var submitted = 0
                 while submitted < min(maxConcurrency, urlsToProcess.count) {
                     let url = urlsToProcess[submitted]
-                    group.addTask { await Track.loadFullMetadata(from: url) }
+                    group.addTask { await Track.loadMetadataOnly(from: url) }
                     submitted += 1
                 }
 
@@ -1962,7 +1978,7 @@ struct ContentView: View {
                     }
                     if submitted < urlsToProcess.count {
                         let url = urlsToProcess[submitted]
-                        group.addTask { await Track.loadFullMetadata(from: url) }
+                        group.addTask { await Track.loadMetadataOnly(from: url) }
                         submitted += 1
                     }
                 }
@@ -1971,10 +1987,15 @@ struct ContentView: View {
             // Group new tracks into albums and merge
             let newAlbums = groupTracksIntoAlbums(newTracks)
 
-            // Populate ArtworkCache for new albums
+            // Extract and cache artwork for new albums (try multiple tracks)
+            var refreshArtworkData: [UUID: Data] = [:]
             for album in newAlbums {
-                if let art = album.artwork {
-                    ArtworkCache.shared.setArtwork(art, forAlbumID: album.id)
+                for track in album.tracks.prefix(3) {
+                    if let artData = await Track.extractArtworkData(from: track.url) {
+                        ArtworkCache.shared.setArtwork(data: artData, forAlbumID: album.id, maxPixelSize: 400)
+                        refreshArtworkData[album.id] = artData
+                        break
+                    }
                 }
             }
 
@@ -1987,8 +2008,16 @@ struct ContentView: View {
                 player.albums = updatedAlbums
                 player.isLoadingLibrary = false
 
-                // Re-cache everything
-                PersistenceService.shared.saveAlbums(updatedAlbums)
+                // Re-cache everything — build complete artwork dictionary from ArtworkCache
+                // for ALL albums (not just new ones)
+                var allArtworkData = refreshArtworkData
+                for album in updatedAlbums {
+                    if allArtworkData[album.id] == nil,
+                       let data = ArtworkCache.shared.artworkData(forAlbumID: album.id) {
+                        allArtworkData[album.id] = data
+                    }
+                }
+                PersistenceService.shared.saveAlbums(updatedAlbums, artworkData: allArtworkData)
             }
         }
     }

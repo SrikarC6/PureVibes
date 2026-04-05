@@ -37,16 +37,32 @@ class MusicPlayer: ObservableObject {
         return favorites.contains(track.id)
     }
     
-    @Published var albums: [Album] = []
-
-    /// Derived from albums — no duplicate storage. Avoids doubling memory for track data.
-    var allTracks: [Track] {
-        albums.flatMap { $0.tracks }
+    @Published var albums: [Album] = [] {
+        didSet {
+            rebuildDerivedState()
+        }
     }
 
-    // Performance-aware animation resolution
+    // MARK: - Cached Derived State (Issue 4: avoid recomputing on every access)
+
+    /// Cached flattened tracks — rebuilt when albums changes.
+    @Published private(set) var cachedAllTracks: [Track] = []
+
+    /// Cached sorted albums — rebuilt when albums changes.
+    @Published private(set) var cachedSortedAlbums: [Album] = []
+
+    /// Track ID → Album ID index for O(1) lookup.
+    private var trackToAlbumID: [UUID: UUID] = [:]
+
+    /// Album ID → Album index for O(1) lookup.
+    private var albumByID: [UUID: Album] = [:]
+
+    /// Derived from albums — uses cached version.
+    var allTracks: [Track] { cachedAllTracks }
+
+    /// Performance-aware animation resolution
     var effectivePerformanceMode: PerformanceMode {
-        PerformanceMode.determine(songCount: allTracks.count)
+        PerformanceMode.determine(songCount: cachedAllTracks.count)
     }
     var effectiveTiltEnabled: Bool {
         prefs.tiltEnabled
@@ -58,26 +74,42 @@ class MusicPlayer: ObservableObject {
         prefs.blurEnabled
     }
     
-    var sortedAlbums: [Album] {
-        albums.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    /// Sorted albums — uses cached version.
+    var sortedAlbums: [Album] { cachedSortedAlbums }
+
+    /// Rebuild all derived state when albums change.
+    private func rebuildDerivedState() {
+        cachedAllTracks = albums.flatMap { $0.tracks }
+        cachedSortedAlbums = albums.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+
+        // Rebuild track → album index
+        trackToAlbumID.removeAll(keepingCapacity: true)
+        albumByID.removeAll(keepingCapacity: true)
+        for album in albums {
+            albumByID[album.id] = album
+            for track in album.tracks {
+                trackToAlbumID[track.id] = album.id
+            }
+        }
     }
 
     /// Looks up artwork for the current track via ArtworkCache (keyed by album ID).
-    /// Falls back to the album's direct artwork if cache misses.
+    /// Uses the O(1) track-to-album index instead of scanning all albums.
     func artworkForCurrentTrack() -> NSImage? {
         guard let track = currentTrack else { return nil }
-        // Find the album containing this track
-        if let album = albums.first(where: { $0.tracks.contains(where: { $0.id == track.id }) }) {
-            return ArtworkCache.shared.artwork(forAlbumID: album.id) ?? album.artwork
+        if let albumID = trackToAlbumID[track.id] {
+            return ArtworkCache.shared.artwork(forAlbumID: albumID)
         }
-        // Fallback to track's own artwork (may be nil after load pipeline nils them)
-        return track.artwork
+        return nil
     }
 
-    /// Looks up the album for the current track.
+    /// Looks up the album for the current track using O(1) index.
     func albumForCurrentTrack() -> Album? {
         guard let track = currentTrack else { return nil }
-        return albums.first(where: { $0.tracks.contains(where: { $0.id == track.id }) })
+        if let albumID = trackToAlbumID[track.id] {
+            return albumByID[albumID]
+        }
+        return nil
     }
 
     @Published var currentWaveform: [CGFloat] = Array(repeating: 0.3, count: 60)
@@ -96,43 +128,6 @@ class MusicPlayer: ObservableObject {
         self.prefs = prefs
         playerDelegate.onFinish = { [weak self] in Task { @MainActor in self?.handleTrackFinished() } }
         setupRemoteCommands()
-    }
-    
-    private func extractWaveform(from url: URL, samples: Int = 60) async -> [CGFloat] {
-        guard let file = try? AVAudioFile(forReading: url),
-              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: UInt32(file.length)) else { return Array(repeating: 0.5, count: samples) }
-        
-        try? file.read(into: buffer)
-        guard let floatData = buffer.floatChannelData?[0] else { return Array(repeating: 0.5, count: samples) }
-        
-        let totalFrames = Int(file.length)
-        let chunk = totalFrames / samples
-        var result: [CGFloat] = []
-        
-        for i in 0..<samples {
-            let start = i * chunk
-            let end = min(start + chunk, totalFrames)
-            var rms: Float = 0
-            
-            let sampleStride = Swift.max(1, (end - start) / 100) 
-            var count = 0
-            
-            for j in Swift.stride(from: start, to: end, by: sampleStride) {
-                let sample = floatData[j]
-                rms += sample * sample
-                count += 1
-            }
-            
-            if count > 0 {
-                let mean = rms / Float(count)
-                rms = sqrt(mean)
-                let normalized = CGFloat(Swift.min(Float(1.0), rms * 2.0)) 
-                result.append(Swift.max(CGFloat(0.05), normalized)) 
-            } else {
-                result.append(0.2)
-            }
-        }
-        return result
     }
     
     private func setupRemoteCommands() {
@@ -181,7 +176,7 @@ class MusicPlayer: ObservableObject {
             info[MPMediaItemPropertyPlaybackDuration] = duration
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = player?.currentTime ?? currentTime
             info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-            // Use ArtworkCache for artwork — avoids retaining per-track NSImage copies
+            // Use ArtworkCache for artwork — no model-held NSImage
             if let artwork = artworkForCurrentTrack() {
                 let mediaArtwork = MPMediaItemArtwork(boundsSize: artwork.size) { _ in artwork }
                 info[MPMediaItemPropertyArtwork] = mediaArtwork
@@ -237,7 +232,8 @@ class MusicPlayer: ObservableObject {
                 if let cached = await PersistenceService.shared.loadCachedWaveform(trackURL: track.url.absoluteString) {
                     await MainActor.run { self?.currentWaveform = cached }
                 } else {
-                    let waveform = await self?.extractWaveform(from: track.url) ?? Array(repeating: 0.3, count: 60)
+                    // Use chunked WaveformExtractor instead of full-file allocation
+                    let waveform = await WaveformExtractor.extract(from: track.url)
                     await MainActor.run { 
                         self?.currentWaveform = waveform 
                     }
@@ -270,7 +266,18 @@ class MusicPlayer: ObservableObject {
     }
     var canGoNext: Bool { currentIndex < queue.count - 1 || loopMode == .queue }
     var canGoPrevious: Bool { currentTime > 3.0 || currentIndex > 0 }
-    private func startTimer() { timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 1.0/10.0, repeats: true) { [weak self] _ in guard let self = self, let player = self.player else { return }; if !self.isScrubbing { self.currentTime = player.currentTime } } }
+
+    /// Issue 4: Reduced timer from 10 Hz (1/10) to 4 Hz (1/4).
+    /// 4 Hz is more than sufficient for smooth scrubber/waveform progress display
+    /// and reduces broad UI invalidation by 60%.
+    private func startTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0/4.0, repeats: true) { [weak self] _ in
+            guard let self = self, let player = self.player else { return }
+            if !self.isScrubbing { self.currentTime = player.currentTime }
+        }
+    }
+
     private func handleTrackFinished() { if canGoNext || loopMode == .single || loopMode == .queue { playNext() } else { isPlaying = false; timer?.invalidate() } }
     
     func moveQueueItems(from source: IndexSet, to destination: Int) { 

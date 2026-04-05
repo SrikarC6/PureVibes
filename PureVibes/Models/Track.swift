@@ -9,7 +9,6 @@ struct Track: Identifiable, Hashable {
     var artist: String
     var albumArtist: String?
     var album: String
-    var artwork: NSImage?
     var trackNumber: Int?
     var discNumber: Int?
     var itunesAdvisory: String?
@@ -72,8 +71,9 @@ struct Track: Identifiable, Hashable {
     }
 
     /// Full metadata load — called on-demand, NOT during library scan.
-    /// Uses an autoreleasepool to ensure AVAsset is freed immediately after extraction.
-    static func loadFullMetadata(from url: URL) async -> Track {
+    /// Artwork is extracted and returned separately as compressed Data,
+    /// NOT stored on the Track model. Caller is responsible for caching via ArtworkCache.
+    static func loadFullMetadata(from url: URL) async -> (track: Track, artworkData: Data?) {
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 autoreleasepool {
@@ -92,25 +92,24 @@ struct Track: Identifiable, Hashable {
                     track.album = metadata.first(where: { $0.commonKey == .commonKeyAlbumName })?.stringValue
                         ?? track.album
 
-                    // Extract artwork
-                    var foundArt: NSImage? = nil
+                    // Extract artwork as compressed Data (NOT decoded NSImage)
+                    var foundArtData: Data? = nil
                     if let item = metadata.first(where: { $0.commonKey == .commonKeyArtwork }),
                        let data = item.dataValue ?? item.value as? Data {
-                        foundArt = NSImage(data: data)
+                        foundArtData = data
                     }
-                    if foundArt == nil {
+                    if foundArtData == nil {
                         for item in metadata {
                             let id = item.identifier?.rawValue ?? ""
                             if id.contains("covr") || id.contains("APIC") || id.contains("artwork") {
                                 if let data = item.dataValue ?? item.value as? Data {
-                                    foundArt = NSImage(data: data)
-                                    if foundArt != nil { break }
+                                    foundArtData = data
+                                    break
                                 }
                             }
                         }
                     }
-                    if foundArt == nil { foundArt = Track.findLooseArtwork(near: url) }
-                    track.artwork = foundArt.flatMap { Track.downscale($0, maxSize: 400) }
+                    if foundArtData == nil { foundArtData = Track.findLooseArtworkData(near: url) }
 
                     // Extract track/disc numbers
                     track.extractTrackAndDiscNumbers(from: metadata, url: url)
@@ -119,7 +118,7 @@ struct Track: Identifiable, Hashable {
                     track.extractAudioFormatInfo(from: asset, url: url)
                     track.extractiTunesMetadata(from: metadata)
 
-                    continuation.resume(returning: track)
+                    continuation.resume(returning: (track, foundArtData))
                 }
             }
         }
@@ -162,9 +161,9 @@ struct Track: Identifiable, Hashable {
         }
     }
 
-    /// Extract artwork from a single audio file URL. Used once per album after grouping.
-    /// Returns a downscaled NSImage or nil. Wrapped in autoreleasepool.
-    static func extractArtwork(from url: URL) async -> NSImage? {
+    /// Extract artwork DATA from a single audio file URL. Used once per album after grouping.
+    /// Returns compressed artwork Data (not a decoded NSImage). Wrapped in autoreleasepool.
+    static func extractArtworkData(from url: URL) async -> Data? {
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 autoreleasepool {
@@ -173,25 +172,24 @@ struct Track: Identifiable, Hashable {
                     ])
                     let metadata = asset.metadata
 
-                    var foundArt: NSImage? = nil
+                    var foundArtData: Data? = nil
                     if let item = metadata.first(where: { $0.commonKey == .commonKeyArtwork }),
                        let data = item.dataValue ?? item.value as? Data {
-                        foundArt = NSImage(data: data)
+                        foundArtData = data
                     }
-                    if foundArt == nil {
+                    if foundArtData == nil {
                         for item in metadata {
                             let id = item.identifier?.rawValue ?? ""
                             if id.contains("covr") || id.contains("APIC") || id.contains("artwork") {
                                 if let data = item.dataValue ?? item.value as? Data {
-                                    foundArt = NSImage(data: data)
-                                    if foundArt != nil { break }
+                                    foundArtData = data
+                                    break
                                 }
                             }
                         }
                     }
-                    if foundArt == nil { foundArt = Track.findLooseArtwork(near: url) }
-                    let result = foundArt.flatMap { Track.downscale($0, maxSize: 400) }
-                    continuation.resume(returning: result)
+                    if foundArtData == nil { foundArtData = Track.findLooseArtworkData(near: url) }
+                    continuation.resume(returning: foundArtData)
                 }
             }
         }
@@ -240,28 +238,20 @@ struct Track: Identifiable, Hashable {
         }
     }
 
-    private static func findLooseArtwork(near url: URL) -> NSImage? {
+    /// Find loose artwork IMAGE file near a track. Returns the file data, not a decoded image.
+    private static func findLooseArtworkData(near url: URL) -> Data? {
         let dir = url.deletingLastPathComponent()
         let names = ["cover", "folder", "album", "front", "artwork"]
         let exts = ["jpg", "jpeg", "png", "webp"]
-        for name in names { for ext in exts { let file = dir.appendingPathComponent("\(name).\(ext)"); if FileManager.default.fileExists(atPath: file.path) { return NSImage(contentsOf: file) } } }
+        for name in names {
+            for ext in exts {
+                let file = dir.appendingPathComponent("\(name).\(ext)")
+                if FileManager.default.fileExists(atPath: file.path) {
+                    return try? Data(contentsOf: file)
+                }
+            }
+        }
         return nil
-    }
-
-    /// Downscale an image to fit within maxSize×maxSize. Returns original if already small enough.
-    private static func downscale(_ image: NSImage, maxSize: CGFloat) -> NSImage {
-        let w = image.size.width
-        let h = image.size.height
-        guard max(w, h) > maxSize else { return image }
-        let scale = maxSize / max(w, h)
-        let newSize = NSSize(width: w * scale, height: h * scale)
-        let resized = NSImage(size: newSize)
-        resized.lockFocus()
-        image.draw(in: NSRect(origin: .zero, size: newSize),
-                   from: NSRect(origin: .zero, size: image.size),
-                   operation: .copy, fraction: 1.0)
-        resized.unlockFocus()
-        return resized
     }
 
     private mutating func extractAudioFormatInfo(from asset: AVAsset, url: URL) {
@@ -318,8 +308,10 @@ struct Track: Identifiable, Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
     /// Async factory — uses full metadata extraction with autoreleasepool.
+    /// Returns Track only (artwork data is discarded — use loadFullMetadata for artwork).
     static func load(from url: URL) async -> Track {
-        await loadFullMetadata(from: url)
+        let (track, _) = await loadFullMetadata(from: url)
+        return track
     }
 
     /// Backward-compatible alias for lightweight init (identical to init(url:) now).

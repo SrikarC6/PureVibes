@@ -31,23 +31,6 @@ extension NSImage {
                      green: Double(totalG / pixelCount / 255.0),
                      blue: Double(totalB / pixelCount / 255.0))
     }
-    
-    /// Returns a downscaled copy cached by pointer identity. Safe to call repeatedly.
-    private static let thumbnailCache = NSCache<NSString, NSImage>()
-    
-    func thumbnail(maxSize: CGFloat = 100) -> NSImage {
-        let cacheKey = "\(self.hash)_\(Int(maxSize))" as NSString
-        if let cached = NSImage.thumbnailCache.object(forKey: cacheKey) { return cached }
-        let scale = min(maxSize / max(size.width, 1), maxSize / max(size.height, 1), 1.0)
-        if scale >= 1.0 { return self }
-        let newSize = NSSize(width: size.width * scale, height: size.height * scale)
-        let thumb = NSImage(size: newSize)
-        thumb.lockFocus()
-        self.draw(in: NSRect(origin: .zero, size: newSize), from: NSRect(origin: .zero, size: size), operation: .copy, fraction: 1.0)
-        thumb.unlockFocus()
-        NSImage.thumbnailCache.setObject(thumb, forKey: cacheKey)
-        return thumb
-    }
 
     func averageBrightness() -> Double {
         guard let cgImage = self.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return 0.5 }

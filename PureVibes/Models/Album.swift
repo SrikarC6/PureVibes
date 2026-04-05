@@ -5,28 +5,17 @@ struct Album: Identifiable, Hashable {
     let title: String
     let artist: String 
     let albumArtist: String?
-    let artwork: NSImage?
-    var tracks: [Track] {
-        didSet {
-            #if DEBUG
-            for track in tracks {
-                assert(track.artwork == nil, "Artwork must not be duplicated in Track models inside an Album.")
-            }
-            #endif
-        }
-    }
+    /// Lightweight reference to the first track URL for on-demand artwork extraction.
+    /// Artwork is NEVER stored as decoded NSImage — it lives only in ArtworkCache.
+    let artworkSourceURL: URL?
+    var tracks: [Track]
 
-    init(title: String, artist: String, albumArtist: String?, artwork: NSImage?, tracks: [Track]) {
+    init(title: String, artist: String, albumArtist: String?, artworkSourceURL: URL? = nil, tracks: [Track]) {
         self.title = title
         self.artist = artist
         self.albumArtist = albumArtist
-        self.artwork = artwork
+        self.artworkSourceURL = artworkSourceURL
         self.tracks = tracks
-        #if DEBUG
-        for track in tracks {
-            assert(track.artwork == nil, "Artwork must not be duplicated in Track models inside an Album.")
-        }
-        #endif
     }
 
     /// Dominant color — computed lazily via ArtworkCache on first access.

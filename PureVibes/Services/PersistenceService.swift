@@ -12,17 +12,12 @@ class PersistenceService {
     static let shared = PersistenceService()
 
     nonisolated let container: NSPersistentContainer
-    private let artworkCache = NSCache<NSString, NSImage>()
     var activeBookmarks: [URL] = []
 
     private init() {
         // Programmatic CoreData model — no .xcdatamodeld required
         let model = PersistenceService.buildModel()
         container = NSPersistentContainer(name: "PureVibes", managedObjectModel: model)
-
-        // Configure artwork cache limits
-        artworkCache.countLimit = 200
-        artworkCache.totalCostLimit = 50_000_000 // ~50 MB
 
         container.loadPersistentStores { description, error in
             if let error = error {
@@ -49,7 +44,7 @@ class PersistenceService {
             attribute("title", .stringAttributeType),
             attribute("artist", .stringAttributeType),
             attribute("albumArtist", .stringAttributeType, optional: true),
-            attribute("artworkData", .binaryDataAttributeType, optional: true),
+            binaryAttribute("artworkData", optional: true),  // External binary storage
             attribute("directoryBookmark", .binaryDataAttributeType, optional: true),
             attribute("cachedAt", .dateAttributeType),
         ]
@@ -66,7 +61,7 @@ class PersistenceService {
             attribute("duration", .doubleAttributeType, optional: true),
             attribute("trackNumber", .integer32AttributeType, optional: true),
             attribute("discNumber", .integer32AttributeType, optional: true),
-            attribute("waveformData", .binaryDataAttributeType, optional: true),
+            binaryAttribute("waveformData", optional: true),  // External binary storage
             attribute("cachedAt", .dateAttributeType),
             attribute("lastModified", .dateAttributeType, optional: true),
         ]
@@ -124,6 +119,20 @@ class PersistenceService {
         attr.name = name
         attr.attributeType = type
         attr.isOptional = optional
+        return attr
+    }
+
+    /// Create a binary attribute with external storage enabled.
+    /// External storage lets Core Data store large blobs on disk instead of inline in the SQLite row.
+    private static func binaryAttribute(
+        _ name: String,
+        optional: Bool = false
+    ) -> NSAttributeDescription {
+        let attr = NSAttributeDescription()
+        attr.name = name
+        attr.attributeType = .binaryDataAttributeType
+        attr.isOptional = optional
+        attr.allowsExternalBinaryDataStorage = true
         return attr
     }
 
@@ -312,17 +321,6 @@ class PersistenceService {
         }
     }
 
-    // MARK: - Artwork Cache (In-Memory)
-
-    func cachedArtwork(for key: String) -> NSImage? {
-        artworkCache.object(forKey: key as NSString)
-    }
-
-    func cacheArtwork(_ image: NSImage, for key: String) {
-        let cost = Int(image.size.width * image.size.height * 4)
-        artworkCache.setObject(image, forKey: key as NSString, cost: cost)
-    }
-
     // MARK: - Library Caching
 
     var cacheVersion: Int {
@@ -330,9 +328,13 @@ class PersistenceService {
         set { UserDefaults.standard.set(newValue, forKey: "LibraryCacheVersion") }
     }
 
-    func saveAlbums(_ albums: [Album]) {
+    /// Save albums to Core Data.
+    /// Artwork data is passed directly — NOT read from ArtworkCache (which is volatile NSCache).
+    func saveAlbums(_ albums: [Album], artworkData: [UUID: Data] = [:]) {
+        // Snapshot artwork data on the calling thread before entering background context
+        let artworkSnapshot = artworkData
         let context = container.newBackgroundContext()
-        context.perform { [weak self] in
+        context.perform {
             let albumFetch = NSFetchRequest<NSFetchRequestResult>(entityName: "CachedAlbum")
             let deleteAlbums = NSBatchDeleteRequest(fetchRequest: albumFetch)
             
@@ -346,7 +348,6 @@ class PersistenceService {
                 
                 let now = Date()
                 for (index, album) in albums.enumerated() {
-                    // Wrap each album in autoreleasepool to free TIFF/JPEG intermediates
                     autoreleasepool {
                         let albumEntity = NSEntityDescription.insertNewObject(forEntityName: "CachedAlbum", into: context)
                         albumEntity.setValue(album.title, forKey: "title")
@@ -354,13 +355,14 @@ class PersistenceService {
                         if let albumArtist = album.albumArtist { albumEntity.setValue(albumArtist, forKey: "albumArtist") }
                         albumEntity.setValue(now, forKey: "cachedAt")
                         
-                        if let artwork = album.artwork, let tiff = artwork.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) {
-                            albumEntity.setValue(data, forKey: "artworkData")
+                        // Use artwork data from the passed-in dictionary (not volatile cache)
+                        if let artData = artworkSnapshot[album.id] {
+                            albumEntity.setValue(artData, forKey: "artworkData")
                         }
                         
                         for track in album.tracks {
                             do {
-                                try self?.saveTrack(track, in: context, cachedAt: now)
+                                try self.saveTrack(track, in: context, cachedAt: now)
                             } catch {
                                 logger.error("Skipping track \(track.url.lastPathComponent): \(error.localizedDescription)")
                             }
@@ -378,6 +380,7 @@ class PersistenceService {
                     }
                 }
                 try context.save()
+                logger.info("Saved \(albums.count) albums, \(artworkSnapshot.count) with artwork data")
             } catch {
                 logger.error("Failed to save albums cache: \(error.localizedDescription)")
             }
@@ -418,69 +421,89 @@ class PersistenceService {
         }
     }
 
-    func loadCachedAlbums() -> [Album]? {
-        let fetch = NSFetchRequest<NSManagedObject>(entityName: "CachedAlbum")
-        do {
-            let results = try context.fetch(fetch)
-            if results.isEmpty { return nil }
-            
-            var albums: [Album] = []
-            let sevenDaysAgo = Date().addingTimeInterval(-7 * 86400)
-            
-            let trackFetch = NSFetchRequest<NSManagedObject>(entityName: "CachedTrack")
-            let trackResults = try context.fetch(trackFetch)
-            var albumTracks: [String: [Track]] = [:]
-            
-            for tObj in trackResults {
-                guard let urlStr = tObj.value(forKey: "url") as? String,
-                      let url = URL(string: urlStr),
-                      let cachedAt = tObj.value(forKey: "cachedAt") as? Date,
-                      cachedAt > sevenDaysAgo else { continue }
-                
-                var track = Track(url: url)
-                track.title = (tObj.value(forKey: "title") as? String) ?? track.title
-                track.artist = (tObj.value(forKey: "artist") as? String) ?? track.artist
-                track.album = (tObj.value(forKey: "album") as? String) ?? track.album
-                if let duration = tObj.value(forKey: "duration") as? Double { track.duration = duration }
-                if let trackNum = tObj.value(forKey: "trackNumber") as? Int32 { track.trackNumber = Int(trackNum) }
-                if let discNum = tObj.value(forKey: "discNumber") as? Int32 { track.discNumber = Int(discNum) }
-                
-                let key = "\(track.album)||||\(track.artist)"
-                albumTracks[key, default: []].append(track)
-            }
-            
-            for res in results {
-                guard let cachedAt = res.value(forKey: "cachedAt") as? Date,
-                      cachedAt > sevenDaysAgo else { continue }
-                
-                let title = (res.value(forKey: "title") as? String) ?? "Unknown Album"
-                let artist = (res.value(forKey: "artist") as? String) ?? "Unknown Artist"
-                let albumArtist = res.value(forKey: "albumArtist") as? String
-                let key = "\(title)||||\(artist)"
-                
-                var artwork: NSImage?
-                if let data = res.value(forKey: "artworkData") as? Data {
-                    artwork = NSImage(data: data)
+    /// Load cached albums using a background context to avoid pinning blobs in viewContext.
+    /// Returns lightweight Album values (no artwork — artwork is fed to ArtworkCache separately).
+    func loadCachedAlbums() -> (albums: [Album], artworkEntries: [(albumID: UUID, data: Data)])? {
+        // Use a background context for heavy materialization to avoid pinning in viewContext
+        let bgContext = container.newBackgroundContext()
+        var resultAlbums: [Album] = []
+        var resultArtwork: [(albumID: UUID, data: Data)] = []
+
+        bgContext.performAndWait {
+            let fetch = NSFetchRequest<NSManagedObject>(entityName: "CachedAlbum")
+            do {
+                let results = try bgContext.fetch(fetch)
+                if results.isEmpty { return }
+
+                let sevenDaysAgo = Date().addingTimeInterval(-7 * 86400)
+
+                let trackFetch = NSFetchRequest<NSManagedObject>(entityName: "CachedTrack")
+                let trackResults = try bgContext.fetch(trackFetch)
+                var albumTracks: [String: [Track]] = [:]
+
+                for tObj in trackResults {
+                    guard let urlStr = tObj.value(forKey: "url") as? String,
+                          let url = URL(string: urlStr),
+                          let cachedAt = tObj.value(forKey: "cachedAt") as? Date,
+                          cachedAt > sevenDaysAgo else { continue }
+
+                    var track = Track(url: url)
+                    track.title = (tObj.value(forKey: "title") as? String) ?? track.title
+                    track.artist = (tObj.value(forKey: "artist") as? String) ?? track.artist
+                    track.album = (tObj.value(forKey: "album") as? String) ?? track.album
+                    if let duration = tObj.value(forKey: "duration") as? Double { track.duration = duration }
+                    if let trackNum = tObj.value(forKey: "trackNumber") as? Int32 { track.trackNumber = Int(trackNum) }
+                    if let discNum = tObj.value(forKey: "discNumber") as? Int32 { track.discNumber = Int(discNum) }
+
+                    // Group by album name ONLY — multi-artist albums have different track artists
+                    // than the resolved album artist, so including artist would split tracks
+                    let key = track.album
+                    albumTracks[key, default: []].append(track)
                 }
-                
-                let tracks = albumTracks[key]?.sorted { 
-                    let d1 = $0.discNumber ?? 1
-                    let d2 = $1.discNumber ?? 1
-                    if d1 != d2 { return d1 < d2 }
-                    return ($0.trackNumber ?? 0) < ($1.trackNumber ?? 0)
-                } ?? []
-                
-                if !tracks.isEmpty {
-                    albums.append(Album(title: title, artist: artist, albumArtist: albumArtist, artwork: artwork, tracks: tracks))
+
+                for res in results {
+                    autoreleasepool {
+                        guard let cachedAt = res.value(forKey: "cachedAt") as? Date,
+                              cachedAt > sevenDaysAgo else { return }
+
+                        let title = (res.value(forKey: "title") as? String) ?? "Unknown Album"
+                        let artist = (res.value(forKey: "artist") as? String) ?? "Unknown Artist"
+                        let albumArtist = res.value(forKey: "albumArtist") as? String
+                        let key = title
+
+                        let tracks = albumTracks[key]?.sorted {
+                            let d1 = $0.discNumber ?? 1
+                            let d2 = $1.discNumber ?? 1
+                            if d1 != d2 { return d1 < d2 }
+                            return ($0.trackNumber ?? 0) < ($1.trackNumber ?? 0)
+                        } ?? []
+
+                        if !tracks.isEmpty {
+                            let album = Album(
+                                title: title,
+                                artist: artist,
+                                albumArtist: albumArtist,
+                                artworkSourceURL: tracks.first?.url,
+                                tracks: tracks
+                            )
+                            resultAlbums.append(album)
+
+                            // Extract artwork data for cache population (not decoded here)
+                            if let artData = res.value(forKey: "artworkData") as? Data {
+                                resultArtwork.append((albumID: album.id, data: artData))
+                            }
+                        }
+                    }
                 }
+            } catch {
+                logger.error("Failed to load cached albums: \(error.localizedDescription)")
             }
-            
-            return albums.isEmpty ? nil : albums
-            
-        } catch {
-            logger.error("Failed to load cached albums: \(error.localizedDescription)")
-            return nil
+
+            // Reset the background context to release all managed objects and blob references
+            bgContext.reset()
         }
+
+        return resultAlbums.isEmpty ? nil : (resultAlbums, resultArtwork)
     }
 
     func loadCachedTrack(url: String) -> Track? {
@@ -585,18 +608,6 @@ class PersistenceService {
                     return ($0.trackNumber ?? 0) < ($1.trackNumber ?? 0)
                 }
                 existingAlbums[existingIdx].tracks = existingTracks
-                // Update artwork if new album has it
-                if newAlbum.artwork != nil {
-                    // We can't mutate the let property, so we replace the album keeping the existing ID concept
-                    // Since Album uses UUID() at init, we create a new one but at the same index
-                    existingAlbums[existingIdx] = Album(
-                        title: existingAlbums[existingIdx].title,
-                        artist: existingAlbums[existingIdx].artist,
-                        albumArtist: existingAlbums[existingIdx].albumArtist,
-                        artwork: newAlbum.artwork,
-                        tracks: existingTracks
-                    )
-                }
             } else {
                 // Brand new album
                 existingAlbums.append(newAlbum)
@@ -620,7 +631,6 @@ class PersistenceService {
             }
         }
         do { try context.save() } catch { logger.error("Failed to save after purge: \(error.localizedDescription)") }
-        artworkCache.removeAllObjects()
         logger.info("All caches purged")
     }
 }
